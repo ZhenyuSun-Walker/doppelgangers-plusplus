@@ -27,6 +27,7 @@ def get_args():
     parser.add_argument('--threshold', type=float, default=0.8, help='Doppelgangers threshold.')
     parser.add_argument('--pretrained', type=str, default='checkpoints/dopp-crop-focalloss_lr1e-3_warmup20/checkpoint-best.pth', help="Path to the pretrained model checkpoint.")
     parser.add_argument('--retrieval_model', type=str, default=None, help="Path to the retrieval model checkpoint.")
+    parser.add_argument('--pair_list_path', type=str, default=None, help="Optional text file with explicit image pairs to verify.")
     parser.add_argument('--skip_mapper', action='store_true', help="Skip COLMAP mapping stage.")
     args = parser.parse_args()
     return args
@@ -51,6 +52,28 @@ def colmap_run_mapper(colmap_bin, colmap_db_path, recon_path, image_root_path):
         raise ValueError(
             '\nSubprocess Error (Return code:'
             f' {colmap_process.returncode} )')
+
+
+def load_explicit_image_pairs(pair_list_path, filelist_relpath):
+    valid = {path.replace('\\', '/'): path.replace('\\', '/') for path in filelist_relpath}
+    valid.update({os.path.basename(path): path.replace('\\', '/') for path in filelist_relpath})
+    image_pairs = []
+    with open(pair_list_path, 'r') as fid:
+        for line in fid:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(f"Invalid pair-list line: {line}")
+            image_path1 = parts[0].replace('\\', '/').lstrip('./')
+            image_path2 = parts[1].replace('\\', '/').lstrip('./')
+            image_path1 = valid.get(image_path1, valid.get(os.path.basename(image_path1)))
+            image_path2 = valid.get(image_path2, valid.get(os.path.basename(image_path2)))
+            if image_path1 is None or image_path2 is None:
+                raise ValueError(f"Pair-list image not found in input_image_path: {line}")
+            image_pairs.append((image_path1, image_path2))
+    return image_pairs
 
 
 if __name__ == '__main__':
@@ -94,47 +117,50 @@ if __name__ == '__main__':
     os.makedirs(args.output_path, exist_ok=True)
     colmap_db_path = os.path.join(args.output_path, 'colmap.db')
     if not os.path.isfile(colmap_db_path) or not os.path.exists(args.output_path + '/pairs.txt'):
-        scene_graph_params = [scenegraph_type]
-        if scenegraph_type in ["swin", "logwin"]:
-            scene_graph_params.append(str(winsize))
-        elif scenegraph_type == "oneref":
-            scene_graph_params.append(str(refid))
-        elif scenegraph_type == "retrieval":
-            winsize = min(20, len(filelist))
-            refid = min(len(filelist) - 1, 10)
-            scene_graph_params.append(str(winsize))  # Na
-            scene_graph_params.append(str(refid))  # k
-        if scenegraph_type in ["swin", "logwin"] and not win_cyclic:
-            scene_graph_params.append('noncyclic')
-        scene_graph = '-'.join(scene_graph_params)
-
-        sim_matrix = None
-        retrieval_model = args.retrieval_model
-        if 'retrieval' in scenegraph_type:
-            assert retrieval_model is not None
-            print("start retrieval")
-            retriever = Retriever(retrieval_model, backbone=model, device=device)
-            with torch.no_grad():
-                sim_matrix = retriever(filelist)
-
-            # Cleanup
-            del retriever
-            torch.cuda.empty_cache()
-            print("finish retrieval")
-            
-
-        print("make pairs")
-        pairs = make_pairs(imgs, scene_graph=scene_graph, prefilter=None, symmetrize=True, sim_mat=sim_matrix)
         root_path = os.path.commonpath(filelist)
         filelist_relpath = [
             os.path.relpath(filename, root_path).replace('\\', '/')
             for filename in filelist
         ]
         kdata = kapture_import_image_folder_or_list((root_path, filelist_relpath), shared_intrinsics)
-        image_pairs = [
-            (filelist_relpath[img1['idx']], filelist_relpath[img2['idx']])
-            for img1, img2 in pairs
-        ]
+        if args.pair_list_path:
+            print("load explicit pairs")
+            image_pairs = load_explicit_image_pairs(args.pair_list_path, filelist_relpath)
+        else:
+            scene_graph_params = [scenegraph_type]
+            if scenegraph_type in ["swin", "logwin"]:
+                scene_graph_params.append(str(winsize))
+            elif scenegraph_type == "oneref":
+                scene_graph_params.append(str(refid))
+            elif scenegraph_type == "retrieval":
+                winsize = min(20, len(filelist))
+                refid = min(len(filelist) - 1, 10)
+                scene_graph_params.append(str(winsize))  # Na
+                scene_graph_params.append(str(refid))  # k
+            if scenegraph_type in ["swin", "logwin"] and not win_cyclic:
+                scene_graph_params.append('noncyclic')
+            scene_graph = '-'.join(scene_graph_params)
+
+            sim_matrix = None
+            retrieval_model = args.retrieval_model
+            if 'retrieval' in scenegraph_type:
+                assert retrieval_model is not None
+                print("start retrieval")
+                retriever = Retriever(retrieval_model, backbone=model, device=device)
+                with torch.no_grad():
+                    sim_matrix = retriever(filelist)
+
+                # Cleanup
+                del retriever
+                torch.cuda.empty_cache()
+                print("finish retrieval")
+
+            print("make pairs")
+            pairs = make_pairs(imgs, scene_graph=scene_graph, prefilter=None, symmetrize=True, sim_mat=sim_matrix)
+            image_pairs = [
+                (filelist_relpath[img1['idx']], filelist_relpath[img2['idx']])
+                for img1, img2 in pairs
+            ]
 
         os.makedirs(os.path.dirname(colmap_db_path), exist_ok=True)
         dopp_pred_path = colmap_db_path.replace('colmap.db', 'doppelgangers_propability_list.npy')
@@ -154,17 +180,21 @@ if __name__ == '__main__':
         #     colmap_db.close()
         #     exit(1)
 
-        if len(colmap_image_pairs) == 0:
-            raise Exception("no matches were kept")
-
-        # colmap db is now full, run colmap
         colmap_world_to_cam = {}
-        print("verify_matches")
-        f = open(args.output_path + '/pairs.txt', "w")
-        for image_path1, image_path2 in colmap_image_pairs:
-            f.write("{} {}\n".format(image_path1, image_path2))
-        f.close()
-        pycolmap.verify_matches(colmap_db_path, args.output_path + '/pairs.txt')
+        pairs_txt_path = args.output_path + '/pairs.txt'
+        with open(pairs_txt_path, "w") as f:
+            for image_path1, image_path2 in colmap_image_pairs:
+                f.write("{} {}\n".format(image_path1, image_path2))
+
+        if len(colmap_image_pairs) == 0:
+            if args.pair_list_path:
+                print("no matches were kept for explicit pairs")
+            else:
+                raise Exception("no matches were kept")
+        else:
+            # colmap db is now full, run colmap
+            print("verify_matches")
+            pycolmap.verify_matches(colmap_db_path, pairs_txt_path)
 
     if not args.skip_mapper:
         reconstruction_path = os.path.join(args.output_path, "reconstruction")
@@ -175,6 +205,4 @@ if __name__ == '__main__':
         # except:
         #     print("unable to reconstruct scene")
     
-
-
 
