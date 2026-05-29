@@ -29,6 +29,11 @@ def get_args():
     parser.add_argument('--retrieval_model', type=str, default=None, help="Path to the retrieval model checkpoint.")
     parser.add_argument('--pair_list_path', type=str, default=None, help="Optional text file with explicit image pairs to verify.")
     parser.add_argument('--skip_mapper', action='store_true', help="Skip COLMAP mapping stage.")
+    parser.add_argument('--image_size', type=int, default=512, help="MASt3R input image size.")
+    parser.add_argument('--patch_size', type=int, default=16, help="MASt3R patch size.")
+    parser.add_argument('--pixel_tol', type=int, default=5, help="Pixel tolerance for sparse correspondence extraction.")
+    parser.add_argument('--conf_thr', type=float, default=1.001, help="Confidence threshold for exported MASt3R matches.")
+    parser.add_argument('--min_len_track', type=int, default=3, help="Minimum track length for exported COLMAP matches.")
     args = parser.parse_args()
     return args
 
@@ -107,7 +112,7 @@ if __name__ == '__main__':
     # filelist.pop(filelist.index(f'{args.input_image_path}/0388.jpg'))
     
     imgs = load_images(filelist, size=512, verbose=False)
-    image_size = 512
+    image_size = args.image_size
     if len(imgs) == 1:
         imgs = [imgs[0], copy.deepcopy(imgs[0])]
         imgs[1]['idx'] = 1
@@ -169,10 +174,10 @@ if __name__ == '__main__':
         kapture_to_colmap(kdata, root_path, tar_handler=None, database=colmap_db,
                         keypoints_type=None, descriptors_type=None, export_two_view_geometry=False)
         print("start processing pairs")
-        colmap_image_pairs = run_mast3r_matching_doppelgangers(model, image_size, 16, device,
+        colmap_image_pairs = run_mast3r_matching_doppelgangers(model, image_size, args.patch_size, device,
                                                 kdata, root_path, image_pairs, colmap_db,
-                                                False, 5, 1.001,
-                                                False, 3,
+                                                False, args.pixel_tol, args.conf_thr,
+                                                False, args.min_len_track,
                                                 dopp_pred_path, args.threshold)
         colmap_db.close()
         # except Exception as e:
@@ -205,4 +210,3 @@ if __name__ == '__main__':
         # except:
         #     print("unable to reconstruct scene")
     
-
